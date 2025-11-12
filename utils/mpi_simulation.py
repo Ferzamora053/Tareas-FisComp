@@ -1,96 +1,152 @@
 import numpy as np
 import time
+import sys
+import os
 from mpi4py import MPI
 
 # Función de Carga P(t)
-def P(t:float, f:float) -> float:
+def P(t: float, f: float) -> float:
   """
-  Calcula la función de carga pulsante P(t). 
+  Calcula la función de carga pulsante P(t).
   """
   return 0.5 * (1 + np.sign(np.sin(2 * np.pi * f * t)))
 
-## Inicialización de MPI
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
-
-## Definición de parámetros
-N = 512         # Resolución de la grilla
-L = 0.05        # Largo de la placa [m]
-alpha = 1.1e-4  # Difusividad térmica del cobre [m^2/s]
-dt = 2.0e-5     # Paso del tiempo [s]
-t_final = 5     # Tiempo de simulación
-f = 0.5         # Frecuencia de la carga [Hz]
-
-h = L / N       # Paso del espacio [m]
-mu = (alpha * dt) / (h**2)
-n_steps = int(t_final // dt)
-
-## Cálculo de la geometría local para cada proceso
-local_N = N // size # Número de filas locales por proceso
-start_row = rank * local_N
-end_row = start_row + local_N
-
-## Inicialización de la grilla local y condiciones iniciales
-# +2 para las celdas fantasmas superior e inferior
-T_local = np.zeros((local_N + 2, N), dtype=np.float64)
-S_mask_local = np.zeros((local_N + 2, N), dtype=np.float64)
-
-# Definir la máscara S_mask_local basado en la posición global
-global_i_min, global_i_max = int(0.4 * N), int(0.6 * N)
-j_min, j_max = int(0.4 * N), int(0.6 * N)
-
-# Convertir i_min e i_max global a índices locales
-i_start = max(0, global_i_min - start_row) + 1     # +1 por la celda fantasma
-i_end = min(local_N, global_i_max - start_row) + 1 # +1 por la celda fantasma
-
-# Aplicar la máscara solo si la franja del proceso se superpone con la fuente
-if i_start < i_end:
-  S_mask_local[i_start:i_end, j_min:j_max] = 145.0
-
-## Definir vecinos
-up_neighbor = rank - 1
-if rank == 0:
-  up_neighbor = MPI.PROC_NULL
-
-down_neighbor = rank + 1
-if rank == size - 1:
-  down_neighbor = MPI.PROC_NULL
-
-comm.Barrier()  # Sincronizar antes de iniciar la simulación
-start_time = MPI.Wtime() # Iniciar el temporizador
-
-## Bucle principal de la simulación paralela
-for n in range(n_steps):
-  # Comunicación de bordes con procesos vecinos
-  comm.Sendrecv(sendbuf=T_local[1, :], dest=up_neighbor,
-                recvbuf=T_local[0, :], source=up_neighbor)
-  comm.Sendrecv(sendbuf=T_local[-2, :], dest=down_neighbor,
-                recvbuf=T_local[-1, :], source=down_neighbor)
+# Función Principal de Simulación (MPI)
+def run_simulation_mpi(comm, N, L, alpha, dt, t_final, f):
+  """
+  Ejecuta la simulación MPI de transferencia de calor para una frecuencia f dada.
   
-  # Calcular la carga actual P(t)
-  t = n * dt
-  Pt = P(t, f)
+  Retorna (solo en rank 0):
+  - T_p: Tiempo de ejecución de la simulación [s]
+  - time_history: Array de tiempos [s]
+  - T_center_history: Array de temperaturas del punto central [K]
+  """
+  
+  # 1. Inicialización MPI y Geometría
+  rank = comm.Get_rank()
+  size = comm.Get_size()
 
-  # Calcular el Laplaciano discreto de forma vectorizada
-  T_laplacian_local = (
-    T_local[2:  , 1:-1] +
-    T_local[0:-2, 1:-1] +
-    T_local[1:-1, 2:  ] +
-    T_local[1:-1, 0:-2] -
-    4 * T_local[1:-1, 1:-1]
-  )
+  h = L / N
+  mu = (alpha * dt) / (h**2)
+  n_steps = int(t_final / dt)
+  
+  local_N = N // size
+  start_row = rank * local_N
+  
+  if rank == 0:
+    print(f"Iniciando Simulación MPI (f={f} Hz, size={size})")
 
-  S_internal_local = S_mask_local[1:-1, 1:-1] * Pt
+  if mu > 0.25:
+    if rank == 0:
+      print("ADVERTENCIA: Simulación INESTABLE (mu > 0.25)")
+    comm.Abort() # Detener todos los procesos si es inestable
+      
+  # 2. Inicialización de Grillas Locales
+  T_local = np.zeros((local_N + 2, N), dtype=np.float64) # +2 celdas fantasma
+  S_mask_local = np.zeros((local_N + 2, N), dtype=np.float64)
 
-  # Actualizar T_local para el tiempo n+1
-  T_local[1:-1, 1:-1] += mu * T_laplacian_local + S_internal_local * dt
+  global_i_min, global_i_max = int(0.4 * N), int(0.6 * N)
+  j_min, j_max = int(0.4 * N), int(0.6 * N)
 
+  i_start = max(0, global_i_min - start_row) + 1  # +1 por fantasma
+  i_end = min(local_N, global_i_max - start_row) + 1 # +1 por fantasma
 
-# Finalización de la simulación paralela y recolección de datos
-comm.Barrier()  # Sincronizar antes de finalizar
-end_time = MPI.Wtime() # Detener el temporizador
+  if i_start < i_end:
+    S_mask_local[i_start:i_end, j_min:j_max] = 145.0
 
-if rank == 0:
-  T_parallel = end_time - start_time
-  print(f"{T_parallel:.4f}")
+  # 3. Definir Vecinos
+  up_neighbor = rank - 1 if rank > 0 else MPI.PROC_NULL
+  down_neighbor = rank + 1 if rank < size - 1 else MPI.PROC_NULL
+
+  # 4. Lógica de Recolección
+  # Encontrar qué rank posee el centro
+  center_row_global = N // 2
+  center_col_local = N // 2
+  center_rank = center_row_global // local_N
+  local_center_row_idx = (center_row_global % local_N) + 1 # +1 por fantasma
+  
+  T_center_history = None
+  time_history = np.linspace(0, t_final, n_steps) # Todos calculan esto
+
+  if rank == center_rank:
+    T_center_history = np.zeros(n_steps, dtype=np.float64) # Solo 1 rank almacena
+
+  # 5. Bucle Principal de Simulación
+  comm.Barrier()
+  start_time = MPI.Wtime()
+
+  for n in range(n_steps):
+    # 1. Comunicación (Intercambio de Halos)
+    comm.Sendrecv(sendbuf=T_local[1, :], dest=up_neighbor,
+                  recvbuf=T_local[0, :], source=up_neighbor)
+    comm.Sendrecv(sendbuf=T_local[-2, :], dest=down_neighbor,
+                  recvbuf=T_local[-1, :], source=down_neighbor)
+    
+    t = n * dt
+    Pt = P(t, f)
+
+    # 2. Cálculo (Vectorizado)
+    T_laplacian_local = (
+      T_local[2:,   1:-1] +
+      T_local[0:-2, 1:-1] + 
+      T_local[1:-1, 2:  ] +
+      T_local[1:-1, 0:-2] - 
+      4 * T_local[1:-1, 1:-1]
+    )
+    S_internal_local = S_mask_local[1:-1, 1:-1] * Pt
+
+    # 3. Actualización
+    T_local[1:-1, 1:-1] += mu * T_laplacian_local + S_internal_local * dt
+
+    # 4. Recolección de datos (solo el rank propietario)
+    if rank == center_rank:
+        T_center_history[n] = T_local[local_center_row_idx, center_col_local]
+
+  comm.Barrier()
+  end_time = MPI.Wtime()
+  T_p = end_time - start_time
+
+  # 6. Recolección Final de Datos en Rank 0
+  if rank == 0:
+    if center_rank != 0:
+      T_center_history = np.zeros(n_steps, dtype=np.float64)
+      comm.Recv(T_center_history, source=center_rank, tag=11)
+
+    print(f"Simulación (f={f} Hz) completada en {T_p:.4f} segundos ({T_p/60:.4f} minutos).")
+
+    output_dir = "./media"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"mpi_results_f_{f:.2f}_p_{size}.npz")
+
+    np.savez(output_file,
+             time=time_history,
+             temp=T_center_history,
+             T_exec=T_p)
+    print(f"Resultados guardados en: {output_file}\n")
+      
+  elif rank == center_rank:
+    # El rank propietario envía sus datos al rank 0
+    comm.Send(T_center_history, dest=0, tag=11)
+
+# Bloque de Ejecución Principal
+if __name__ == "__main__":
+  
+  # 1. Leer Frecuencia desde Argumentos de Línea de Comandos
+  if len(sys.argv) != 2:
+    if MPI.COMM_WORLD.Get_rank() == 0:
+      print("Error: El script debe llamarse con una frecuencia como argumento.")
+      print(f"Ejemplo: mpiexec -n 8 python {sys.argv[0]} 0.5")
+    MPI.COMM_WORLD.Abort()
+      
+  f_arg = float(sys.argv[1]) # Leer f (0.5 o 10.0)
+
+  # 2. Parámetros Globales
+  N = 512
+  L = 0.05
+  alpha = 1.1e-4
+  dt = 2.0e-5
+  t_final = 5.0
+
+  # 3. Inicializar MPI y Ejecutar Simulación
+  comm = MPI.COMM_WORLD
+  run_simulation_mpi(comm, N, L, alpha, dt, t_final, f=f_arg)
