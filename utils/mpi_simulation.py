@@ -114,7 +114,7 @@ def run_simulation_mpi(comm, N, L, alpha, dt, t_final, f):
 
     print(f"Simulación (f={f} Hz) completada en {T_p:.4f} segundos ({T_p/60:.4f} minutos).")
 
-    output_dir = "./media"
+    output_dir = "./output"
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"mpi_results_f_{f:.2f}_p_{size}.npz")
 
