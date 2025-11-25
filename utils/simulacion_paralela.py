@@ -1,13 +1,20 @@
 import multiprocessing as mp
 import numpy as np
+import os
 import time
+import random
 from typing import Tuple
 from numpy.typing import NDArray
 from random_walk_laplace import randomWalk_Laplace
 
+def _init_worker(seed_offset: int = 0):
+  """Inicializador para cada worker: siembra RNG por proceso."""
+  random.seed(seed_offset + os.getpid() + int(time.time() % 1_000_000))
+
 def run_parallel_simulation(N: int, M: int, num_procs: int) -> Tuple[NDArray[np.float64], float]:
   """
   Configura y ejecuta la simulación paralela.
+  Si num_procs = 1, ejecuta en serie (sin Pool) para un T1 razonable.
   Retorna: (Matriz de Potencial, Tiempo de ejecución)
   """
   
@@ -22,11 +29,16 @@ def run_parallel_simulation(N: int, M: int, num_procs: int) -> Tuple[NDArray[np.
 
   # Crear el pool de procesos y ejecutar las tareas
   # 'chunksize' ayuda a reducir el overhead de comunicación
-  with mp.Pool(processes=num_procs) as pool:
-    results = pool.map(randomWalk_Laplace, tasks)
+  if num_procs == 1:
+    # Ruta serial: evita la sobrecarga de Pool para medición T1 real
+    results = [randomWalk_Laplace(t) for t in tasks]
+  else:
+    # Ruta paralela con Pool y initializer para sembrar RNG
+    with mp.Pool(processes=num_procs, initializer=_init_worker, initargs=(12345,)) as pool:
+        results = pool.map(randomWalk_Laplace, tasks)
 
    # Reconstruir la matriz de potencial 2D a partir de la lista plana de resultados
-  V_parallel = np.zeros((N, N))
+  V_parallel = np.zeros((N, N), dtype=np.float64)
   V_parallel[0, :] = 100.0  # Condición de borde superior
   # Los otros bordes ya son 0.0 por defecto en np.zeros
   
@@ -39,6 +51,7 @@ def run_parallel_simulation(N: int, M: int, num_procs: int) -> Tuple[NDArray[np.
 
   end_time = time.time()
   total_time = end_time - start_time
+  
   return V_parallel, total_time
 
 # Bloque para probar este archivo por sí solo si fuera necesario
